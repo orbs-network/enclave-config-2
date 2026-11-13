@@ -1,0 +1,90 @@
+# Co-signer audit image for Google Confidential Space.
+#
+# The Confidential Space attestation token names this image's exact digest,
+# so everything the digest covers is attested: the binary, the scorer and
+# every ENV below. The measured settings (release tag, sealed-settings
+# commitment, platform, key mode, price source, audit modes, and which Secret
+# Manager versions are read through which Workload Identity provider) are
+# baked in as build args: one tag = one image = one digest = one attested key.
+#
+# deploy-gcp.sh builds from a context it stages with `git archive` at a clean
+# commit (shared/, backend/, tee/ and the scorer only; tee/ and the
+# GIT_COMMIT build arg are needed since Phase R R5), with SOURCE_DATE_EPOCH set
+# to the commit time and timestamps rewritten, so anyone can rebuild the same
+# tree with the same build args and compare digests.
+#
+# Secrets (AUDIT_SECRET_CONFIG, AUDIT_SECRET_TELEGRAM_BOT_TOKEN) are not in
+# the image: the binary reads them from Secret Manager at boot with a
+# federated token that IAM grants only to this image's digest. The binary
+# refuses AUDIT_SECRET_CONFIG unless it matches the measured commitment.
+
+# golang:1.25.6-bookworm on the build host's platform, cross-compiling a static
+# linux/amd64 binary: Confidential VMs are x86-64.
+FROM --platform=$BUILDPLATFORM golang@sha256:f4490d7b261d73af4543c46ac6597d7d101b6e1755bcdd8c5159fda7046b6b3e AS build
+ARG SOURCE_DATE_EPOCH=0
+# GIT_COMMIT is the full commit this image is built from, stamped into the
+# replayed TEE code (tee/internal/buildinfo.Commit) exactly as the TEE binary
+# is stamped (ops/deploy/build-host-source.sh). The auditor replays an
+# operation only when the TEE that signed it reports the same commit (Phase R
+# R-D6); left at "unknown", every replay is listed as unchecked.
+ARG GIT_COMMIT=unknown
+# TEE_CODE_HASH is scripts/tee-code-hash.sh at that commit: the replay
+# matches an operation only when its teeBuild equals it.
+ARG TEE_CODE_HASH=unknown
+WORKDIR /src
+COPY shared/go.mod shared/go.sum ./shared/
+COPY tee/go.mod tee/go.sum ./tee/
+COPY backend/go.mod backend/go.sum ./backend/
+RUN cd backend && GOWORK=off GOFLAGS=-mod=readonly go mod download
+COPY shared/ ./shared/
+# Only the replay package and the TEE code it runs: no keys, tests or binaries.
+COPY tee/internal/ ./tee/internal/
+COPY tee/replay/ ./tee/replay/
+COPY backend/ ./backend/
+RUN cd backend && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOWORK=off GOFLAGS=-mod=readonly go build -trimpath -buildvcs=false -ldflags="-s -w -buildid= -X github.com/orbs/perpetual-hub/tee/internal/buildinfo.Commit=${GIT_COMMIT} -X github.com/orbs/perpetual-hub/tee/internal/buildinfo.CodeHash=${TEE_CODE_HASH}" -o /out/cosigner-audit ./cmd/cosigner-audit && touch -d "@${SOURCE_DATE_EPOCH}" /out/cosigner-audit
+# No enclave image carries a binary built with a test-only build tag
+# (restinglimits, teefakebinance): a tagged image measures differently and is
+# never granted ROLLUP_VERIFIER_ROLE, but the build refuses it first. Inline,
+# not a copied script, so the git-archive build context stays unchanged.
+# ops/deploy/test-build-tag-gate.sh runs this exact step on real binaries.
+RUN for bin in /out/cosigner-audit; do \
+      info="$(go version -m "$bin")" || { echo "refusing ${bin}: no readable Go build info" >&2; exit 1; }; \
+      tags="$(printf '%s\n' "$info" | awk '$1 == "build" && index($2, "-tags=") == 1 { print substr($2, 7) }' | tr ',' ' ')"; \
+      for tag in $tags; do \
+        case "$tag" in restinglimits|teefakebinance) echo "refusing ${bin}: built with test-only tag ${tag}" >&2; exit 1 ;; esac; \
+      done; \
+    done
+
+# python:3.12.11-slim-bookworm (the deterministic scorer is standard-library
+# only), pinned to amd64.
+FROM --platform=linux/amd64 python@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
+ARG AUDIT_RELEASE_TAG
+ARG AUDIT_CONFIG_COMMITMENT
+ARG AUDIT_PRICE_SOURCE=binance-futures
+ARG AUDIT_MODES=light
+ARG AUDIT_GCP_WORKLOAD_PROVIDER
+ARG AUDIT_GCP_SECRETS
+COPY --from=build /out/cosigner-audit /app/cosigner-audit
+COPY skills/analyze-perpetual-user-health/scripts/calculate_health_score.py /app/skills/analyze-perpetual-user-health/scripts/calculate_health_score.py
+ENV AUDIT_RELEASE_TAG=${AUDIT_RELEASE_TAG} \
+    AUDIT_CONFIG_COMMITMENT=${AUDIT_CONFIG_COMMITMENT} \
+    AUDIT_PLATFORM=gcp \
+    AUDIT_KEY_MODE=confidential-space \
+    AUDIT_PRICE_SOURCE=${AUDIT_PRICE_SOURCE} \
+    AUDIT_MODES=${AUDIT_MODES} \
+    AUDIT_SECRETS_SOURCE=gcp-secret-manager \
+    AUDIT_GCP_WORKLOAD_PROVIDER=${AUDIT_GCP_WORKLOAD_PROVIDER} \
+    AUDIT_GCP_SECRETS=${AUDIT_GCP_SECRETS} \
+    AUDIT_LISTEN_ADDR=0.0.0.0:8090 \
+    AUDIT_REPO_PATH=/app
+WORKDIR /app
+# Launch policy, enforced by the Confidential Space launcher: the operator may
+# not override the command or any environment variable (no
+# allow_env_override label), and container logs leave the VM only on the
+# debug image.
+LABEL "tee.launch_policy.allow_cmd_override"="false"
+LABEL "tee.launch_policy.log_redirect"="debugonly"
+# The default (root) user, as in Google's samples: the launcher's token socket
+# and token file are mounted for it, and the VM runs nothing else.
+EXPOSE 8090
+ENTRYPOINT ["/app/cosigner-audit"]
